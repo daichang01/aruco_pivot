@@ -13,7 +13,7 @@ def generate_launch_description():
 
     aruco_node = Node(
         package='ros2_aruco',
-        executable='aruco_node',
+        executable='board_calibration_node',
         parameters=[aruco_params]
     )
 

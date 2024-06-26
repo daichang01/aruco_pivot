@@ -24,9 +24,10 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'aruco_node = ros2_aruco.aruco_node:main',
+            'pivot_calibration_node = ros2_aruco.pivot_calibration_node:main',
             'aruco_generate_marker = ros2_aruco.aruco_generate_marker:main',
-            "tip_tracking_node = ros2_aruco.tip_tracking_node:main"
+            "tip_tracking_node = ros2_aruco.tip_tracking_node:main",
+            "board_calibration_node = ros2_aruco.board_calibration_node:main"
         ],
     },
 )
