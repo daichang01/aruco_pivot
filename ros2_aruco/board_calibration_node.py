@@ -180,9 +180,11 @@ class ArucoNode(rclpy.node.Node):
         # 计算工具中心点位置
         tool_avg_rot_matrix, tool_avg_tvec = self.calculate_center(rvecs_list, tvecs_list)
         self.publish_tool_marker_position(tool_avg_tvec)
-        # 计算针尖相对于工具中心的偏移
-        self.tip_calibration_offset = board_center_position - tool_avg_tvec
-        self.get_logger().info(f"Calibrated tip offset: {self.tip_calibration_offset}")
+        # 计算针尖相对于工具中心的偏移 (工具坐标系下)
+        tool_avg_rot_matrix_T = tool_avg_rot_matrix.T  # 工具上 ArUco 码相对于相机的旋转矩阵的转置
+        tip_calibration_offset_tool = tool_avg_rot_matrix_T @ (board_center_position - tool_avg_tvec)
+        self.tip_calibration_offset = tip_calibration_offset_tool
+        self.get_logger().info(f"Calibrated tip offset in tool coordinates: {self.tip_calibration_offset}")
         self.calibration_mode = False
 
     def calculate_real_time_tip_position(self, rvecs, tvecs):
