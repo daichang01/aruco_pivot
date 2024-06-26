@@ -12,6 +12,7 @@ from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from std_srvs.srv import Empty
 # from .pivot_calibration import PivotCalibration
 from scipy.optimize import least_squares
+from filterpy.kalman import KalmanFilter
 
 
     
@@ -71,6 +72,20 @@ class ArucoNode(rclpy.node.Node):
         #保存board标定结果
         self.tip_calibration_offset = None
         self.calibration_mode = False  # Flag to enable calibration mode
+
+        self.tip_calibration_offsets = []  # 存储多次采集的偏移量
+        self.calibration_samples = 20  # 采集样本数量
+        self.current_samples = 0
+
+        # Initialize Kalman Filter
+        self.kf = KalmanFilter(dim_x=6, dim_z=3)
+        self.kf.F = np.eye(6)  # State transition matrix
+        self.kf.H = np.hstack([np.eye(3), np.zeros((3, 3))])  # Measurement function
+        self.kf.P *= 1000.  # Initial uncertainty
+        self.kf.R = np.eye(3) * 0.01  # Measurement noise
+        self.kf.Q = np.eye(6) * 0.01  # Process noise
+        self.kf.x[:3] = 0  # Initial state (assuming the needle starts at the origin)
+        self.kf.x[3:] = 0  # Initial velocity
 
 
     def info_callback(self, info_msg):
@@ -162,10 +177,15 @@ class ArucoNode(rclpy.node.Node):
                     tip_position = self.calculate_real_time_tip_position(tool_rvecs_list, tool_tvecs_list)
                     self.publish_tool_tip_position(tip_position)
             
-
+    def apply_kalman_filter(self, position):
+        self.kf.predict()
+        self.kf.update(position)
+        return self.kf.x[:3]
     def calibrate_tip_callback(self, request, response):
         self.get_logger().info("Calibration request received.start calibrating")
         self.calibration_mode = True
+        self.current_samples = 0
+        self.tip_calibration_offsets = []
         return response
     
     def caculate_tip_offset(self, board_center_position, rvecs_list, tvecs_list):
@@ -183,9 +203,22 @@ class ArucoNode(rclpy.node.Node):
         # 计算针尖相对于工具中心的偏移 (工具坐标系下)
         tool_avg_rot_matrix_T = tool_avg_rot_matrix.T  # 工具上 ArUco 码相对于相机的旋转矩阵的转置
         tip_calibration_offset_tool = tool_avg_rot_matrix_T @ (board_center_position - tool_avg_tvec)
-        self.tip_calibration_offset = tip_calibration_offset_tool
-        self.get_logger().info(f"Calibrated tip offset in tool coordinates: {self.tip_calibration_offset}")
-        self.calibration_mode = False
+
+        # 存储当前采集的偏移量
+        self.tip_calibration_offsets.append(tip_calibration_offset_tool)
+        self.current_samples += 1
+        self.get_logger().info(f"Collected {self.current_samples} samples/total need {self.calibration_samples}")
+
+        if self.current_samples >= self.calibration_samples:
+            # 计算平均偏移量
+            avg_tip_calibration_offset = np.mean(self.tip_calibration_offsets, axis=0)
+            self.tip_calibration_offset = avg_tip_calibration_offset
+            self.get_logger().info(f"Calibrated tip offset in tool coordinates: {self.tip_calibration_offset}")
+
+            # 重置采样计数器和偏移量列表
+            self.current_samples = 0
+            self.tip_calibration_offsets = []
+            self.calibration_mode = False
 
     def calculate_real_time_tip_position(self, rvecs, tvecs):
         """
@@ -217,12 +250,14 @@ class ArucoNode(rclpy.node.Node):
         # 计算针尖的位置 (avg_tvec + avg_rot_matrix * tip_calibration_offset)
         # tip_position = np.dot(avg_rot_matrix, self.tip_calibration_offset) + avg_tvec
         tip_position = avg_tvec + avg_rot_matrix @ np.array(self.tip_calibration_offset) 
-        return tip_position
+        # Apply Kalman Filter
+        smoothed_tip_position = self.apply_kalman_filter(tip_position)
+        return smoothed_tip_position
 
     
     def publish_tool_tip_position(self, tip_position):
         if tip_position is None:
-            self.get_logger().warn("未计算出针尖位置；无法发布。")
+            # self.get_logger().warn("未计算出针尖位置；无法发布。")
             return
         point = PointStamped()
         point.header.frame_id = self.camera_frame if self.camera_frame else self.info_msg.header.frame_id
