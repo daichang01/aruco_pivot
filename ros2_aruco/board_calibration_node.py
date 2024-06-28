@@ -12,7 +12,8 @@ from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from std_srvs.srv import Empty
 # from .pivot_calibration import PivotCalibration
 from scipy.optimize import least_squares
-from filterpy.kalman import KalmanFilter
+from filterpy.kalman import KalmanFilter, ExtendedKalmanFilter
+import threading
 
 
     
@@ -41,7 +42,7 @@ class ArucoNode(rclpy.node.Node):
         # Make sure we have a valid dictionary id:
         try:
             dictionary_id = cv2.aruco.__getattribute__(dictionary_id_name)
-            if type(dictionary_id) != type(cv2.aruco.DICT_5X5_100):
+            if type(dictionary_id) != type(cv2.aruco.DICT_5X5_250):
                 raise AttributeError
         except AttributeError:
             self.get_logger().error(
@@ -58,6 +59,7 @@ class ArucoNode(rclpy.node.Node):
         self.markers_pub = self.create_publisher(ArucoMarkers, "aruco_markers", 10)
         self.tip_pub = self.create_publisher(PointStamped, "tool_tip_position", 10)
         self.tool_marker = self.create_publisher(PointStamped, "tool_marker_positon", 10)
+        self.image_pub = self.create_publisher(Image, "aruco_image", 10)
         # Create calibration service
         self.create_service(Empty, 'calibrate_tip', self.calibrate_tip_callback)
 
@@ -87,6 +89,21 @@ class ArucoNode(rclpy.node.Node):
         self.kf.x[:3] = 0  # Initial state (assuming the needle starts at the origin)
         self.kf.x[3:] = 0  # Initial velocity
 
+        # Initialize Extended Kalman Filter
+        self.ekf = ExtendedKalmanFilter(dim_x=6, dim_z=3)
+        self.ekf.x[:3] = 0  # 初始状态估计
+        self.ekf.x[3:] = 0  # 初始速度估计
+        self.ekf.F = np.eye(6)  # 状态转移矩阵可能需要在迭代中更新
+        self.ekf.H = np.eye(3, 6)  # 测量矩阵可能需要在迭代中更新
+        self.ekf.P *= 1000  # 初始协方差
+        self.ekf.R = np.eye(3) * 0.01  # 测量噪声
+        self.ekf.Q = np.eye(6) * 0.01  # 过程噪声
+
+        # 相机内参
+        self.fx = 641.9315185546875
+        self.fy = 641.9315185546875
+        self.cx = 643.0005493164062
+        self.cy = 362.68548583984375
 
     def info_callback(self, info_msg):
         self.info_msg = info_msg
@@ -151,6 +168,7 @@ class ArucoNode(rclpy.node.Node):
                 markers.poses.append(pose)
                 markers.marker_ids.append(marker_id[0])
 
+
                 if marker_id[0] in range(1, 5):  # 标定板上的 ArUco 码 ID
                     rvecs_list.append(rvecs[i])
                     tvecs_list.append(tvecs[i])
@@ -158,8 +176,14 @@ class ArucoNode(rclpy.node.Node):
                 elif marker_id[0] in range(10, 16): # 工具上的Aruco码ID
                     tool_rvecs_list.append(rvecs[i])
                     tool_tvecs_list.append(tvecs[i])
+
+
             self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
+            # 在图像上绘制检测到的 ArUco 标记
+            cv2.aruco.drawDetectedMarkers(cv_image, corners, marker_ids)
+            
+            
 
             # 计算标定板中心点位置
             if self.calibration_mode and rvecs_list and tvecs_list:
@@ -176,6 +200,17 @@ class ArucoNode(rclpy.node.Node):
                 if self.tip_calibration_offset is not None:
                     tip_position = self.calculate_real_time_tip_position(tool_rvecs_list, tool_tvecs_list)
                     self.publish_tool_tip_position(tip_position)
+                    if tip_position is not None:
+                        image_point = self.project_to_image(tip_position)
+                        cv2.circle(cv_image, (int(image_point[0]), int(image_point[1])), 5, (0, 255, 0), -1)
+            
+            # image_message = self.bridge.cv2_to_imgmsg(cv_image, encoding="mono8")
+            # self.image_pub.publish(image_message)
+
+            # cv_image = cv2.resize(cv_image, (640, 480), interpolation=cv2.INTER_LINEAR)
+            # cv2.imshow("Aruco Image", cv_image)
+            # if cv2.waitKey(1) & 0xFF == ord('q'):
+            #     cv2.destroyAllWindows()
             
     def apply_kalman_filter(self, position):
         self.kf.predict()
@@ -306,7 +341,15 @@ class ArucoNode(rclpy.node.Node):
         # board_center_world = avg_rot_matrix @ np.array([0.0, 0.0, 0.0]) + avg_tvec
         return avg_rot_matrix, avg_tvec  # 返回旋转矩阵和平移向量
 
-
+    def project_to_image(self, point):
+        """将世界坐标系中的点转换为图像坐标系"""
+        x, y, z = point
+        u = (self.fx * x / z) + self.cx
+        v = (self.fy * y / z) + self.cy
+        if z <= 0:
+            return None
+        return (u, v)
+    
 
 
 
