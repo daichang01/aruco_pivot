@@ -89,15 +89,14 @@ class ArucoNode(rclpy.node.Node):
         self.kf.x[:3] = 0  # Initial state (assuming the needle starts at the origin)
         self.kf.x[3:] = 0  # Initial velocity
 
-        # Initialize Extended Kalman Filter
-        self.ekf = ExtendedKalmanFilter(dim_x=6, dim_z=3)
-        self.ekf.x[:3] = 0  # 初始状态估计
-        self.ekf.x[3:] = 0  # 初始速度估计
-        self.ekf.F = np.eye(6)  # 状态转移矩阵可能需要在迭代中更新
-        self.ekf.H = np.eye(3, 6)  # 测量矩阵可能需要在迭代中更新
-        self.ekf.P *= 1000  # 初始协方差
-        self.ekf.R = np.eye(3) * 0.01  # 测量噪声
-        self.ekf.Q = np.eye(6) * 0.01  # 过程噪声
+        # 初始化 EKF
+        # self.ekf = ExtendedKalmanFilter(dim_x=6, dim_z=3)
+        # self.ekf.x[:3] = 0  # 初始状态估计
+        # self.ekf.x[3:] = 0  # 初始速度估计
+        # self.ekf.P *= 1000  # 初始协方差
+        # self.ekf.R = np.eye(3) * 0.01  # 测量噪声
+        # self.ekf.Q = np.eye(6) * 0.01  # 过程噪声
+
 
         # 相机内参
         self.fx = 641.9315185546875
@@ -183,7 +182,8 @@ class ArucoNode(rclpy.node.Node):
             # 在图像上绘制检测到的 ArUco 标记
             cv2.aruco.drawDetectedMarkers(cv_image, corners, marker_ids)
             
-            
+            # # 获取当前时间
+            # current_time = self.get_clock().now()
 
             # 计算标定板中心点位置
             if self.calibration_mode and rvecs_list and tvecs_list:
@@ -198,6 +198,12 @@ class ArucoNode(rclpy.node.Node):
             else:
             # 实时计算针尖位置
                 if self.tip_calibration_offset is not None:
+                    # if not hasattr(self, 'last_time'):
+                        # 如果是第一次调用，则初始化 last_time
+                        # self.last_time = current_time
+                    # 计算时间间隔 dt
+                    # dt = (current_time - self.last_time).nanoseconds / 1e9  # 将纳秒转换为秒
+                    # self.last_time = current_time
                     tip_position = self.calculate_real_time_tip_position(tool_rvecs_list, tool_tvecs_list)
                     self.publish_tool_tip_position(tip_position)
                     if tip_position is not None:
@@ -216,6 +222,24 @@ class ArucoNode(rclpy.node.Node):
         self.kf.predict()
         self.kf.update(position)
         return self.kf.x[:3]
+    
+
+    def apply_extended_kalman_filter(self, position, dt):
+        # 更新状态转移矩阵
+        self.ekf.F = self.state_transition_jacobian(self.ekf.x, dt)
+        self.ekf.predict()
+
+        # 更新测量。这里需要确保正确计算了预测测量值 Hx
+        self.ekf.update(
+            z=position,  # 实际测量值
+            HJacobian=self.measurement_jacobian(self.ekf.x),  # 测量的雅可比矩阵
+            Hx=self.measurement_function  # 预测测量函数
+        )
+
+        return self.ekf.x[:3]
+
+
+
     def calibrate_tip_callback(self, request, response):
         self.get_logger().info("Calibration request received.start calibrating")
         self.calibration_mode = True
@@ -287,6 +311,8 @@ class ArucoNode(rclpy.node.Node):
         tip_position = avg_tvec + avg_rot_matrix @ np.array(self.tip_calibration_offset) 
         # Apply Kalman Filter
         smoothed_tip_position = self.apply_kalman_filter(tip_position)
+        # Apply extender kalman filter
+        # smoothed_tip_position = self.apply_extended_kalman_filter(tip_position, dt)
         return smoothed_tip_position
 
     
@@ -350,6 +376,35 @@ class ArucoNode(rclpy.node.Node):
             return None
         return (u, v)
     
+    #EKF
+    def state_transition_function(self, x, dt):
+        """非线性状态转移函数"""
+        F = np.eye(6)
+        F[0, 3] = dt
+        F[1, 4] = dt
+        F[2, 5] = dt
+        return F @ x
+
+    def state_transition_jacobian(self, x, dt):
+        """状态转移函数的雅各比矩阵"""
+        F = np.eye(6)
+        F[0, 3] = dt
+        F[1, 4] = dt
+        F[2, 5] = dt
+        return F
+
+    def measurement_function(self, x):
+        """非线性测量函数"""
+        return x[:3]
+
+    def measurement_jacobian(self, x):
+        """测量函数的雅各比矩阵"""
+        H = np.zeros((3, 6))
+        H[0, 0] = 1
+        H[1, 1] = 1
+        H[2, 2] = 1
+        return H
+
 
 
 
