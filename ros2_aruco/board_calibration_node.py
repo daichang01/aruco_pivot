@@ -69,7 +69,8 @@ class ArucoNode(rclpy.node.Node):
         self.distortion = None
 
         self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
-        self.aruco_parameters = cv2.aruco.DetectorParameters()
+        # self.aruco_parameters = cv2.aruco.DetectorParameters()
+        self.aruco_parameters = cv2.aruco.DetectorParameters_create()
         self.bridge = CvBridge()
         #保存board标定结果
         self.tip_calibration_offset = None
