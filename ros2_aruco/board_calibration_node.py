@@ -1,11 +1,11 @@
 import rclpy
 import rclpy.node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data,QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
 import numpy as np
 import cv2
 import transforms3d as tf3d
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from geometry_msgs.msg import PoseArray, Pose, PointStamped
 from ros2_aruco_interfaces.msg import ArucoMarkers
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
@@ -13,7 +13,7 @@ from std_srvs.srv import Empty
 # from .pivot_calibration import PivotCalibration
 from scipy.optimize import least_squares
 from filterpy.kalman import KalmanFilter, ExtendedKalmanFilter
-import threading
+from sensor_msgs_py import point_cloud2  # 用于解析 PointCloud2
 
 
     
@@ -50,16 +50,33 @@ class ArucoNode(rclpy.node.Node):
             )
             options = "\n".join([s for s in dir(cv2.aruco) if s.startswith("DICT")])
             self.get_logger().error("valid options: {}".format(options))
+        
+        # qos = QoSProfile(
+        #     history=HistoryPolicy.KEEP_LAST,
+        #     depth=1,
+        #     reliability=ReliabilityPolicy.BEST_EFFORT
+        # )
 
         # Set up subscriptions
-        self.info_sub = self.create_subscription(CameraInfo, info_topic, self.info_callback, qos_profile_sensor_data)
-        self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, qos_profile_sensor_data)
+        self.info_sub = self.create_subscription(CameraInfo, info_topic, self.info_callback, 10)
+        self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
+       
+
         # Set up publishers
         self.poses_pub = self.create_publisher(PoseArray, "aruco_poses", 10)
         self.markers_pub = self.create_publisher(ArucoMarkers, "aruco_markers", 10)
         self.tip_pub = self.create_publisher(PointStamped, "tool_tip_position", 10)
         self.tool_marker = self.create_publisher(PointStamped, "tool_marker_positon", 10)
-        self.image_pub = self.create_publisher(Image, "aruco_image", 10)
+        self.aruco_image_pub = self.create_publisher(Image, "aruco_image", 10)
+        self.trans_image_pub = self.create_publisher(Image, "trans_image", 10)
+        self.valpoints_image_pub = self.create_publisher(Image, "valpoints_image", 10)
+
+
+
+        # 订阅 /trans_pcd_topic
+        self.trans_pcd_sub = self.create_subscription(PointCloud2,'/trans_pcd_topic',self.trans_pcd_callback,10)
+        # 订阅 /trans_pcd_point
+        self.trans_point_sub = self.create_subscription(PointCloud2,'/trans_pcd_point',self.trans_point_callback,10)
         # Create calibration service
         self.create_service(Empty, 'calibrate_tip', self.calibrate_tip_callback)
 
@@ -80,13 +97,23 @@ class ArucoNode(rclpy.node.Node):
         self.calibration_samples = 20  # 采集样本数量
         self.current_samples = 0
 
+        # 初始化 cv_image 为 None
+        self.cv_image = None
+
         # Initialize Kalman Filter
+        # 设置状态向量维度 dim_x 为6，观测向量维度 dim_z 为3。
         self.kf = KalmanFilter(dim_x=6, dim_z=3)
+        # F 为状态转移矩阵，这里设置为6x6单位矩阵，意味着状态变量各自独立变化。
         self.kf.F = np.eye(6)  # State transition matrix
+        # H 为观测矩阵，它将状态向量映射到观测空间，这里前3个状态变量直接被观测到，后3个状态变量不被直接观测。
         self.kf.H = np.hstack([np.eye(3), np.zeros((3, 3))])  # Measurement function
+        # P 为初始估计误差协方差矩阵，较大的值（如1000）表示对初态不确定性较高。
         self.kf.P *= 1000.  # Initial uncertainty
+        # R 为观测噪声协方差矩阵，较小的值（如0.01）表示观测相对准确。
         self.kf.R = np.eye(3) * 0.01  # Measurement noise
-        self.kf.Q = np.eye(6) * 0.01  # Process noise
+        # Q 为过程噪声协方差矩阵，较小的值（如0.01）表示系统动态变化平缓。
+        self.kf.Q = np.eye(6) * 0.001  # Process noise
+        # x 的前3个元素设为0，表示初始状态（如位置）为原点；后3个元素设为0，表示初始速度为0。
         self.kf.x[:3] = 0  # Initial state (assuming the needle starts at the origin)
         self.kf.x[3:] = 0  # Initial velocity
 
@@ -117,7 +144,10 @@ class ArucoNode(rclpy.node.Node):
             self.get_logger().warn("No camera info has been received!")
             return
 
-        cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="mono8")
+        self.cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="mono8")
+
+
+        # 初始化ArucoMarkers和PoseArray消息
         markers = ArucoMarkers()
         pose_array = PoseArray()
         if self.camera_frame == "":
@@ -131,7 +161,7 @@ class ArucoNode(rclpy.node.Node):
         pose_array.header.stamp = img_msg.header.stamp
 
         corners, marker_ids, rejected = cv2.aruco.detectMarkers(
-            cv_image, self.aruco_dictionary, parameters=self.aruco_parameters
+            self.cv_image, self.aruco_dictionary, parameters=self.aruco_parameters
         )
 
         rvecs_list, tvecs_list = [], []
@@ -181,13 +211,13 @@ class ArucoNode(rclpy.node.Node):
             self.poses_pub.publish(pose_array)
             self.markers_pub.publish(markers)
             # 在图像上绘制检测到的 ArUco 标记
-            cv2.aruco.drawDetectedMarkers(cv_image, corners, marker_ids)
+            cv2.aruco.drawDetectedMarkers(self.cv_image, corners, marker_ids)
             
             # # 获取当前时间
             # current_time = self.get_clock().now()
 
             # 计算标定板中心点位置
-            if self.calibration_mode and rvecs_list and tvecs_list:
+            if self.calibration_mode and len(rvecs_list) == 4 and len(tvecs_list) == 4:
             # if  rvecs_list and tvecs_list:
                 board_avg_rot_matrix, board_avg_tvec = self.calculate_center(rvecs_list, tvecs_list)
                 board_center_position = board_avg_tvec
@@ -199,46 +229,23 @@ class ArucoNode(rclpy.node.Node):
             else:
             # 实时计算针尖位置
                 if self.tip_calibration_offset is not None:
-                    # if not hasattr(self, 'last_time'):
-                        # 如果是第一次调用，则初始化 last_time
-                        # self.last_time = current_time
-                    # 计算时间间隔 dt
-                    # dt = (current_time - self.last_time).nanoseconds / 1e9  # 将纳秒转换为秒
-                    # self.last_time = current_time
                     tip_position = self.calculate_real_time_tip_position(tool_rvecs_list, tool_tvecs_list)
                     self.publish_tool_tip_position(tip_position)
                     if tip_position is not None:
                         image_point = self.project_to_image(tip_position)
-                        cv2.circle(cv_image, (int(image_point[0]), int(image_point[1])), 5, (0, 255, 0), -1)
+                        cv2.circle(self.cv_image, (int(image_point[0]), int(image_point[1])), 5, (0, 255, 0), -1)
             
-            # image_message = self.bridge.cv2_to_imgmsg(cv_image, encoding="mono8")
-            # self.image_pub.publish(image_message)
-
-            # cv_image = cv2.resize(cv_image, (640, 480), interpolation=cv2.INTER_LINEAR)
-            # cv2.imshow("Aruco Image", cv_image)
-            # if cv2.waitKey(1) & 0xFF == ord('q'):
-            #     cv2.destroyAllWindows()
+        # image_message = self.bridge.cv2_to_imgmsg(self.cv_image, encoding="mono8")
+        # self.aruco_image_pub.publish(image_message)
+        cv2.imshow("Aruco Image", self.cv_image)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            cv2.destroyAllWindows()
             
     def apply_kalman_filter(self, position):
         self.kf.predict()
         self.kf.update(position)
         return self.kf.x[:3]
     
-
-    def apply_extended_kalman_filter(self, position, dt):
-        # 更新状态转移矩阵
-        self.ekf.F = self.state_transition_jacobian(self.ekf.x, dt)
-        self.ekf.predict()
-
-        # 更新测量。这里需要确保正确计算了预测测量值 Hx
-        self.ekf.update(
-            z=position,  # 实际测量值
-            HJacobian=self.measurement_jacobian(self.ekf.x),  # 测量的雅可比矩阵
-            Hx=self.measurement_function  # 预测测量函数
-        )
-
-        return self.ekf.x[:3]
-
 
 
     def calibrate_tip_callback(self, request, response):
@@ -248,13 +255,69 @@ class ArucoNode(rclpy.node.Node):
         self.tip_calibration_offsets = []
         return response
     
+    def trans_pcd_callback(self, msg):
+        if self.cv_image is None:
+            return
+
+        trans_image = self.cv_image.copy()
+        # 将灰度图像转换为 RGB 图像
+        trans_image = cv2.cvtColor(trans_image, cv2.COLOR_GRAY2RGB)
+
+        # 解析 PointCloud2 数据
+        points = []
+        for point in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+            points.append([point[0], point[1], point[2]])
+
+        points = np.array(points)
+
+        # 投影点到图像上
+        for point in points:
+            u, v = self.project_to_image(point)
+            if 0 <= u < trans_image.shape[1] and 0 <= v < trans_image.shape[0]:
+                cv2.circle(trans_image, (int(u), int(v)), 1, (0, 255, 0), -1)
+
+        # 显示图像
+        # cv2.imshow("Aruco Image with trans", trans_image)
+        # if cv2.waitKey(1) & 0xFF == ord('q'):
+        #     cv2.destroyAllWindows()
+        image_message = self.bridge.cv2_to_imgmsg(trans_image)
+        self.trans_image_pub.publish(image_message)
+
+    def trans_point_callback(self, msg):
+        if self.cv_image is None:
+            return
+
+        trans_image = self.cv_image.copy()
+        # 将灰度图像转换为 RGB 图像
+        trans_image = cv2.cvtColor(trans_image, cv2.COLOR_GRAY2RGB)
+
+        # 解析 PointCloud2 数据
+        points = []
+        for point in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+            points.append([point[0], point[1], point[2]])
+
+        points = np.array(points)
+
+        # 投影点到图像上
+        for point in points:
+            u, v = self.project_to_image(point)
+            if 0 <= u < trans_image.shape[1] and 0 <= v < trans_image.shape[0]:
+                cv2.circle(trans_image, (int(u), int(v)), 2, (0, 0, 255), -1)
+
+        # 显示图像
+        # cv2.imshow("Aruco Image with val", trans_image)
+        # if cv2.waitKey(1) & 0xFF == ord('q'):
+        #     cv2.destroyAllWindows()
+        image_message = self.bridge.cv2_to_imgmsg(trans_image)
+        self.valpoints_image_pub.publish(image_message)
+    
     def caculate_tip_offset(self, board_center_position, rvecs_list, tvecs_list):
         """
         校准针尖相对于工具上的 ArUco 码的固定偏移。
         """
         # 确保旋转向量和平移向量的数量相同，并且都大于3
-        if len(rvecs_list) <= 3 or len(tvecs_list) <= 3:
-            self.get_logger().warn("Calibration requires more than 3 markers.")
+        if len(rvecs_list) != 6 or len(tvecs_list) != 6:
+            self.get_logger().warn("Calibration requires must 6 markers.")
             return
         assert len(rvecs_list) == len(tvecs_list), "The number of rotation and translation vectors must be the same"
         # 计算工具中心点位置
@@ -273,7 +336,7 @@ class ArucoNode(rclpy.node.Node):
             # 计算平均偏移量
             avg_tip_calibration_offset = np.mean(self.tip_calibration_offsets, axis=0)
             self.tip_calibration_offset = avg_tip_calibration_offset
-            self.get_logger().info(f"Calibrated tip offset in tool coordinates: {self.tip_calibration_offset}")
+            self.get_logger().info(f"Calibrated tip offset in tool coordinates: {self.tip_calibration_offset}！！！！！！！！！")
 
             # 重置采样计数器和偏移量列表
             self.current_samples = 0
@@ -288,6 +351,9 @@ class ArucoNode(rclpy.node.Node):
             return None
 
         num_markers = len(rvecs)
+        if num_markers != 6:
+            self.get_logger().info(f"track require all 6 markers!")
+            return None
         avg_rot_matrix = np.zeros((3, 3))
         avg_tvec = np.zeros(3)
 
@@ -377,34 +443,6 @@ class ArucoNode(rclpy.node.Node):
             return None
         return (u, v)
     
-    #EKF
-    def state_transition_function(self, x, dt):
-        """非线性状态转移函数"""
-        F = np.eye(6)
-        F[0, 3] = dt
-        F[1, 4] = dt
-        F[2, 5] = dt
-        return F @ x
-
-    def state_transition_jacobian(self, x, dt):
-        """状态转移函数的雅各比矩阵"""
-        F = np.eye(6)
-        F[0, 3] = dt
-        F[1, 4] = dt
-        F[2, 5] = dt
-        return F
-
-    def measurement_function(self, x):
-        """非线性测量函数"""
-        return x[:3]
-
-    def measurement_jacobian(self, x):
-        """测量函数的雅各比矩阵"""
-        H = np.zeros((3, 6))
-        H[0, 0] = 1
-        H[1, 1] = 1
-        H[2, 2] = 1
-        return H
 
 
 
