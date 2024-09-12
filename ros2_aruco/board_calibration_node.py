@@ -14,6 +14,9 @@ from std_srvs.srv import Empty
 from scipy.optimize import least_squares
 from filterpy.kalman import KalmanFilter, ExtendedKalmanFilter
 from sensor_msgs_py import point_cloud2  # 用于解析 PointCloud2
+import pickle
+
+
 
 
     
@@ -39,6 +42,7 @@ class ArucoNode(rclpy.node.Node):
         self.camera_frame = (self.get_parameter("camera_frame").get_parameter_value().string_value)
         self.get_logger().info(f"camera frame: {self.camera_frame}")
 
+
         # Make sure we have a valid dictionary id:
         try:
             dictionary_id = cv2.aruco.__getattribute__(dictionary_id_name)
@@ -51,11 +55,6 @@ class ArucoNode(rclpy.node.Node):
             options = "\n".join([s for s in dir(cv2.aruco) if s.startswith("DICT")])
             self.get_logger().error("valid options: {}".format(options))
         
-        # qos = QoSProfile(
-        #     history=HistoryPolicy.KEEP_LAST,
-        #     depth=1,
-        #     reliability=ReliabilityPolicy.BEST_EFFORT
-        # )
 
         # Set up subscriptions
         self.info_sub = self.create_subscription(CameraInfo, info_topic, self.info_callback, 10)
@@ -100,6 +99,8 @@ class ArucoNode(rclpy.node.Node):
         # 初始化 cv_image 为 None
         self.cv_image = None
 
+        # 初始化时尝试加载标定结果
+        self.load_calibration_result()
         # Initialize Kalman Filter
         # 设置状态向量维度 dim_x 为6，观测向量维度 dim_z 为3。
         self.kf = KalmanFilter(dim_x=6, dim_z=3)
@@ -139,6 +140,10 @@ class ArucoNode(rclpy.node.Node):
         # Assume that camera parameters will remain the same...
         self.destroy_subscription(self.info_sub)
 
+    def save_calibration_result(self, file_path="/home/daichang/Desktop/teeth_ws/src/aruco_pivot/pin_cali_res/calibration_data.pkl"):
+        with open(file_path, "wb") as f:
+            pickle.dump(self.tip_calibration_offset, f)
+        self.get_logger().info(f"Calibration result saved to {file_path}")
     def image_callback(self, img_msg):
         if self.info_msg is None:
             self.get_logger().warn("No camera info has been received!")
@@ -146,6 +151,9 @@ class ArucoNode(rclpy.node.Node):
 
         self.cv_image = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding="mono8")
 
+        # 添加自适应直方图均衡化（CLAHE）来增强图像
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        self.cv_image = clahe.apply(self.cv_image)
 
         # 初始化ArucoMarkers和PoseArray消息
         markers = ArucoMarkers()
@@ -234,6 +242,12 @@ class ArucoNode(rclpy.node.Node):
                     if tip_position is not None:
                         image_point = self.project_to_image(tip_position)
                         cv2.circle(self.cv_image, (int(image_point[0]), int(image_point[1])), 5, (0, 255, 0), -1)
+
+                        # 将针尖位置转换为 Python 浮点数，单位转为毫米 (mm)，并保留两位小数
+                        tip_x, tip_y, tip_z = float(tip_position[0]) * 1000, float(tip_position[1]) * 1000, float(tip_position[2]) * 1000
+                        tip_text = f"Tip Position: X={tip_x:.2f} mm, Y={tip_y:.2f} mm, Z={tip_z:.2f} mm"
+                        cv2.putText(self.cv_image, tip_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+
             
         # image_message = self.bridge.cv2_to_imgmsg(self.cv_image, encoding="mono8")
         # self.aruco_image_pub.publish(image_message)
@@ -274,7 +288,18 @@ class ArucoNode(rclpy.node.Node):
         for point in points:
             u, v = self.project_to_image(point)
             if 0 <= u < trans_image.shape[1] and 0 <= v < trans_image.shape[0]:
-                cv2.circle(trans_image, (int(u), int(v)), 1, (0, 255, 0), -1)
+                # cv2.circle(trans_image, (int(u), int(v)), 1, (0, 255, 0), -1)
+                # 根据深度调整颜色和大小
+                color_intensity = min(255, max(0, int(255 * (point[2] / np.max(points[:, 2])))))
+                color = (0, 255 - color_intensity, color_intensity)  # 使用渐变颜色
+                radius = 1  # 设置点的半径，较小的半径使点更精细
+                thickness = -1  # 填充点
+                # 绘制圆形点并启用抗锯齿
+                cv2.circle(trans_image, (int(u), int(v)), radius, color, thickness, lineType=cv2.LINE_AA)
+                            # 设置单个像素点的颜色
+                # color_intensity = min(255, max(0, int(255 * (point[2] / np.max(points[:, 2])))))
+                # color = (0, 255 - color_intensity, color_intensity)  # 使用渐变颜色
+                # trans_image[int(v), int(u)] = color  # 直接修改像素值
 
         # 显示图像
         # cv2.imshow("Aruco Image with trans", trans_image)
@@ -311,6 +336,16 @@ class ArucoNode(rclpy.node.Node):
         image_message = self.bridge.cv2_to_imgmsg(trans_image)
         self.valpoints_image_pub.publish(image_message)
     
+    def load_calibration_result(self, file_path="/home/daichang/Desktop/teeth_ws/src/aruco_pivot/pin_cali_res/calibration_data.pkl"):
+        try:
+            with open(file_path, "rb") as f:
+                self.tip_calibration_offset = pickle.load(f)
+                self.get_logger().info(f"tip_calibration_offset: {self.tip_calibration_offset}")
+            self.get_logger().info(f"Calibration result loaded from {file_path}")
+        except FileNotFoundError:
+            self.get_logger().warn(f"No calibration file found at {file_path}, please calibrate the system.")
+
+    
     def caculate_tip_offset(self, board_center_position, rvecs_list, tvecs_list):
         """
         校准针尖相对于工具上的 ArUco 码的固定偏移。
@@ -337,6 +372,9 @@ class ArucoNode(rclpy.node.Node):
             avg_tip_calibration_offset = np.mean(self.tip_calibration_offsets, axis=0)
             self.tip_calibration_offset = avg_tip_calibration_offset
             self.get_logger().info(f"Calibrated tip offset in tool coordinates: {self.tip_calibration_offset}！！！！！！！！！")
+
+            #保存标定结果
+            self.save_calibration_result()
 
             # 重置采样计数器和偏移量列表
             self.current_samples = 0
@@ -403,8 +441,8 @@ class ArucoNode(rclpy.node.Node):
         point.header.frame_id = self.camera_frame if self.camera_frame else self.info_msg.header.frame_id
         point.header.stamp = self.get_clock().now().to_msg()
         point.point.x = float(marker_position[0])
-        point.point.x = float(marker_position[1])
-        point.point.x = float(marker_position[2])
+        point.point.y = float(marker_position[1])
+        point.point.z = float(marker_position[2])
         self.tool_marker.publish(point)
 
     def calculate_center(self, rvecs, tvecs):
