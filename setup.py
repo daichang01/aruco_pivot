@@ -26,7 +26,8 @@ setup(
         'console_scripts': [
             'aruco_generate_marker = ros2_aruco.aruco_generate_marker:main',
             "tip_tracking_node = ros2_aruco.tip_tracking_node:main",
-            "board_calibration_node = ros2_aruco.board_calibration_node:main"
+            "board_calibration_node = ros2_aruco.board_calibration_node:main",
+            "keyboard_publisher = ros2_aruco.keyboard_publisher:main"
         ],
     },
 )

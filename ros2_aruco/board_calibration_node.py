@@ -15,11 +15,10 @@ from scipy.optimize import least_squares
 from filterpy.kalman import KalmanFilter, ExtendedKalmanFilter
 from sensor_msgs_py import point_cloud2  # 用于解析 PointCloud2
 import pickle
+from .KFClass import KalmanFilterWrapper
+from .EKFClass import ExtendedKalmanFilterClass
 
 
-
-
-    
 class ArucoNode(rclpy.node.Node):
     def __init__(self):
         super().__init__("aruco_node")
@@ -102,29 +101,12 @@ class ArucoNode(rclpy.node.Node):
         # 初始化时尝试加载标定结果
         self.load_calibration_result()
         # Initialize Kalman Filter
-        # 设置状态向量维度 dim_x 为6，观测向量维度 dim_z 为3。
-        self.kf = KalmanFilter(dim_x=6, dim_z=3)
-        # F 为状态转移矩阵，这里设置为6x6单位矩阵，意味着状态变量各自独立变化。
-        self.kf.F = np.eye(6)  # State transition matrix
-        # H 为观测矩阵，它将状态向量映射到观测空间，这里前3个状态变量直接被观测到，后3个状态变量不被直接观测。
-        self.kf.H = np.hstack([np.eye(3), np.zeros((3, 3))])  # Measurement function
-        # P 为初始估计误差协方差矩阵，较大的值（如1000）表示对初态不确定性较高。
-        self.kf.P *= 1000.  # Initial uncertainty
-        # R 为观测噪声协方差矩阵，较小的值（如0.01）表示观测相对准确。
-        self.kf.R = np.eye(3) * 0.01  # Measurement noise
-        # Q 为过程噪声协方差矩阵，较小的值（如0.01）表示系统动态变化平缓。
-        self.kf.Q = np.eye(6) * 0.001  # Process noise
-        # x 的前3个元素设为0，表示初始状态（如位置）为原点；后3个元素设为0，表示初始速度为0。
-        self.kf.x[:3] = 0  # Initial state (assuming the needle starts at the origin)
-        self.kf.x[3:] = 0  # Initial velocity
 
-        # 初始化 EKF
-        # self.ekf = ExtendedKalmanFilter(dim_x=6, dim_z=3)
-        # self.ekf.x[:3] = 0  # 初始状态估计
-        # self.ekf.x[3:] = 0  # 初始速度估计
-        # self.ekf.P *= 1000  # 初始协方差
-        # self.ekf.R = np.eye(3) * 0.01  # 测量噪声
-        # self.ekf.Q = np.eye(6) * 0.01  # 过程噪声
+        # Initialize Kalman Filter 
+        self.kalman_filter = KalmanFilterWrapper()
+        # Initialize Extended Kalman Filter
+        self.ekf = ExtendedKalmanFilterClass()
+        self.dt = 0.1
 
 
         # 相机内参
@@ -238,11 +220,15 @@ class ArucoNode(rclpy.node.Node):
             # 实时计算针尖位置
                 if self.tip_calibration_offset is not None:
                     tip_position = self.calculate_real_time_tip_position(tool_rvecs_list, tool_tvecs_list)
+                            # 确保 tip_position 是一个一维数组
                     self.publish_tool_tip_position(tip_position)
                     if tip_position is not None:
                         image_point = self.project_to_image(tip_position)
-                        cv2.circle(self.cv_image, (int(image_point[0]), int(image_point[1])), 5, (0, 255, 0), -1)
-
+                        if image_point is not None:
+                            # 确保图像点有效，然后在图像上绘制标记
+                            cv2.circle(self.cv_image, (int(image_point[0]), int(image_point[1])), 5, (0, 255, 0), -1)
+                        else:
+                            self.get_logger().warn("Invalid image point, skipping drawing.")
                         # 将针尖位置转换为 Python 浮点数，单位转为毫米 (mm)，并保留两位小数
                         tip_x, tip_y, tip_z = float(tip_position[0]) * 1000, float(tip_position[1]) * 1000, float(tip_position[2]) * 1000
                         tip_text = f"Tip Position: X={tip_x:.2f} mm, Y={tip_y:.2f} mm, Z={tip_z:.2f} mm"
@@ -256,10 +242,26 @@ class ArucoNode(rclpy.node.Node):
             cv2.destroyAllWindows()
             
     def apply_kalman_filter(self, position):
-        self.kf.predict()
-        self.kf.update(position)
-        return self.kf.x[:3]
-    
+        return self.kalman_filter.predict_and_update(position)
+
+
+    def apply_ekf(self, tip_position):
+        """
+        应用扩展卡尔曼滤波器，返回长度为3的smoothed_tip_position
+        """
+        self.ekf.update(tip_position, self.dt)
+        smoothed_tip_position = self.ekf.get_state()
+
+        # 检查 smoothed_tip_position 的维度，并确保其为二维矩阵，保留第一行
+        if len(smoothed_tip_position.shape) == 2 and smoothed_tip_position.shape[0] > 0:
+            # 只返回第一行
+            return smoothed_tip_position[0]
+        elif len(smoothed_tip_position.shape) == 1:
+            # 如果是 1 维数组，直接返回
+            return smoothed_tip_position
+        else:
+            self.get_logger().warn(f"Unexpected smoothed_tip_position shape: {smoothed_tip_position.shape}")
+            return smoothed_tip_position
 
 
     def calibrate_tip_callback(self, request, response):
@@ -392,20 +394,9 @@ class ArucoNode(rclpy.node.Node):
         if num_markers != 6:
             self.get_logger().info(f"track require all 6 markers!")
             return None
-        avg_rot_matrix = np.zeros((3, 3))
-        avg_tvec = np.zeros(3)
 
-        # 对所有检测到的Aruco码位置和姿态进行平均
-        for rvec, tvec in zip(rvecs, tvecs):
-            # 将每个码的旋转向量转换为旋转矩阵，并累加旋转矩阵和平移向量
-            rot_matrix = cv2.Rodrigues(rvec)[0]
-            avg_rot_matrix += rot_matrix
-            # avg_tvec += tvec[0]  
-            avg_tvec += tvec.reshape(-1) # 确保tvec是一维的
+        avg_rot_matrix, avg_tvec = self.calculate_center(rvecs, tvecs)
 
-        # 计算平均旋转矩阵和平均平移向量
-        avg_rot_matrix /= num_markers
-        avg_tvec /= num_markers
 
         # 正规化旋转矩阵，确保平均后的矩阵仍然是一个合法的旋转矩阵
         U, _, Vt = np.linalg.svd(avg_rot_matrix)
@@ -413,14 +404,62 @@ class ArucoNode(rclpy.node.Node):
 
         # 计算针尖的位置 (avg_tvec + avg_rot_matrix * tip_calibration_offset)
         # tip_position = np.dot(avg_rot_matrix, self.tip_calibration_offset) + avg_tvec
-        tip_position = avg_tvec + avg_rot_matrix @ np.array(self.tip_calibration_offset) 
+        tip_position = avg_tvec + avg_rot_matrix @ np.array(self.tip_calibration_offset).reshape(3)
         # Apply Kalman Filter
-        smoothed_tip_position = self.apply_kalman_filter(tip_position)
+        # smoothed_tip_position = self.apply_kalman_filter(tip_position)
         # Apply extender kalman filter
-        # smoothed_tip_position = self.apply_extended_kalman_filter(tip_position, dt)
-        return smoothed_tip_position
+        smoothed_tip_position = self.apply_ekf(tip_position)
+        if smoothed_tip_position.size == 3:
 
-    
+            return smoothed_tip_position
+        else:
+            self.get_logger().warn(f"Unexpected smoothed_tip_position size: {smoothed_tip_position.size}")
+            return None          
+
+    def remove_outliers(self, data, threshold=3):
+        """
+        剔除异常值，超过 `threshold` 个标准差的数据将被剔除
+        :param data: 输入的标记位置数据 (n个标记的坐标，如平移向量)
+        :param threshold: 阈值，默认是3个标准差
+        :return: 剔除异常值后的数据
+        """
+        # 计算均值和标准差
+        mean = np.mean(data, axis=0)
+        std_dev = np.std(data, axis=0)
+        
+        # 找出绝对距离超过 threshold * 标准差的点（异常值）
+        valid_mask = np.all(np.abs(data - mean) <= threshold * std_dev, axis=1)
+        
+        # 剔除异常值
+        cleaned_data = data[valid_mask]
+        
+        return cleaned_data
+
+    def remove_outliers_rvecs(self, rvecs, threshold=3):
+        """
+        剔除旋转向量中的异常值
+        :param rvecs: 输入的旋转向量列表
+        :param threshold: 阈值，默认是3个标准差
+        :return: 剔除异常值后的旋转向量
+        """
+        # 将 rvecs 转换为旋转矩阵
+        rotation_matrices = np.array([cv2.Rodrigues(rvec)[0] for rvec in rvecs])
+
+        # 提取旋转矩阵中的分量
+        rotation_vectors_flat = rotation_matrices.reshape(len(rvecs), -1)
+
+        # 对旋转矩阵的分量进行剔除异常值处理
+        rotation_vectors_cleaned_flat = self.remove_outliers(rotation_vectors_flat, threshold)
+
+        # 将清理后的平坦矩阵重新转换为旋转矩阵
+        rotation_matrices_cleaned = rotation_vectors_cleaned_flat.reshape(-1, 3, 3)
+
+        # 将旋转矩阵转换回旋转向量
+        rvecs_cleaned = [cv2.Rodrigues(rot_matrix)[0] for rot_matrix in rotation_matrices_cleaned]
+        # self.get_logger().info(f"len of cleaned rvecs: {len(rvecs_cleaned)}")
+
+        return rvecs_cleaned
+        
     def publish_tool_tip_position(self, tip_position):
         if tip_position is None:
             # self.get_logger().warn("未计算出针尖位置；无法发布。")
@@ -453,16 +492,24 @@ class ArucoNode(rclpy.node.Node):
         
         avg_rot_matrix = np.zeros((3, 3), dtype=np.float32)
         avg_tvec = np.zeros(3, dtype=np.float32)
+
+        # 对旋转向量进行剔除异常值
+        rvecs_cleaned = self.remove_outliers_rvecs(rvecs, threshold=2)
+        if len(rvecs_cleaned) < 2:
+            return None
         
         for rvec, tvec in zip(rvecs, tvecs):
-            rot_matrix = cv2.Rodrigues(rvec)[0]
-            avg_rot_matrix += rot_matrix
+            # rot_matrix = cv2.Rodrigues(rvec)[0]
+            # avg_rot_matrix += rot_matrix
             avg_tvec += tvec[0]  # 确保 tvec 是正确的形状
         
         # 对旋转矩阵和平移向量求平均
         num_markers = len(rvecs)
-        avg_rot_matrix /= num_markers
+        # avg_rot_matrix /= num_markers
         avg_tvec /= num_markers
+        # 对剔除后的旋转向量进行平均处理
+        avg_rot_matrix = np.mean([cv2.Rodrigues(rvec)[0] for rvec in rvecs_cleaned], axis=0)
+
         
         # 将旋转矩阵正规化以保证其为合法的旋转矩阵
         U, _, Vt = np.linalg.svd(avg_rot_matrix)
@@ -474,6 +521,14 @@ class ArucoNode(rclpy.node.Node):
 
     def project_to_image(self, point):
         """将世界坐标系中的点转换为图像坐标系"""
+            # 确保 point 是一个长度为 3 的数组或列表
+        if isinstance(point, np.ndarray):
+            point = point.flatten()
+
+        if len(point) != 3:
+            self.get_logger().warn(f"Invalid point length: {len(point)}")
+            return None
+
         x, y, z = point
         u = (self.fx * x / z) + self.cx
         v = (self.fy * y / z) + self.cy
