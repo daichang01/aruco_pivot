@@ -94,8 +94,19 @@ class ArucoNode(rclpy.node.Node):
         self.tip_calibration_offsets = []  # 存储多次采集的偏移量
         self.calibration_samples = 20  # 采集样本数量
         self.current_samples = 0
-
+        
+        # 八棱柱标定初始化
+        self.required_markers_ids = list(range(10, 18))  # 需要检测的 ArUco 码 ID 列表
         self.aruco_relative_poses = self.caculate_relative_pose()  # 存储八棱柱上每个 ArUco 标记物的位姿
+        self.detected_markers = set()  # 用于记录检测到的 ArUco 码 ID
+        self.marker_poses = {}  # 用于存储每个标记的位姿
+        # 用于存储每个标记 ID 的检测次数和位姿数据
+        self.marker_detections = {
+            marker_id: {'count': 0, 'rvecs': [], 'tvecs': []}
+            for marker_id in self.required_markers_ids
+        }
+        self.required_markers_count = 8  # 标定要求至少8个不同的 ArUco 码
+        self.required_detections_per_marker = 10  # 每个ID需要的最少检测次数
 
         # 初始化 cv_image 为 None
         self.cv_image = None
@@ -128,6 +139,8 @@ class ArucoNode(rclpy.node.Node):
         with open(file_path, "wb") as f:
             pickle.dump(self.tip_calibration_offset, f)
         self.get_logger().info(f"Calibration result saved to {file_path}")
+        
+    # 一张画面抓取
     def image_callback(self, img_msg):
         if self.info_msg is None:
             self.get_logger().warn("No camera info has been received!")
@@ -196,10 +209,20 @@ class ArucoNode(rclpy.node.Node):
                     tvecs_list.append(tvecs[i])
 
                 elif marker_id[0] in range(10, 18): # 工具上的Aruco码ID
-                    # tool_rvecs_list.append(rvecs[i])
                     tool_rvecs_list.append((marker_id[0], rvecs[i])) 
-                    # tool_tvecs_list.append(tvecs[i])
                     tool_tvecs_list.append((marker_id[0], tvecs[i]))
+                    marker_id_int = marker_id[0]
+                     # 更新检测计数和位姿数据
+                    if self.calibration_mode:
+                        self.marker_detections[marker_id_int]['count'] += 1
+                        self.marker_detections[marker_id_int]['rvecs'].append(rvecs[i])
+                        self.marker_detections[marker_id_int]['tvecs'].append(tvecs[i])
+
+                    self.detected_markers.add(marker_id_int)
+                    self.marker_poses[marker_id[0]] = {
+                    'rvec': rvecs[i],
+                    'tvec': tvecs[i]
+                    }
 
 
             self.poses_pub.publish(pose_array)
@@ -217,9 +240,12 @@ class ArucoNode(rclpy.node.Node):
                 board_center_position = board_avg_tvec
                 if board_center_position is not None:
                     self.publish_tool_tip_position(board_center_position)
-
+                if len(tool_rvecs_list) <= 0:
+                    self.get_logger().warn("No tool markers detected, skipping tip calibration.")
+                    return
                 #进行针尖校准
-                self.caculate_tip_offset(board_center_position, tool_rvecs_list, tool_tvecs_list)
+                # self.caculate_tip_offset(board_center_position, tool_rvecs_list, tool_tvecs_list)
+                self.caculate_tip_offset(board_center_position)
             else:
             # 实时计算针尖位置
                 if self.tip_calibration_offset is not None:
@@ -244,6 +270,89 @@ class ArucoNode(rclpy.node.Node):
         cv2.imshow("Aruco Image", self.cv_image)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             cv2.destroyAllWindows()
+
+    def caculate_tip_offset(self,board_center_position):
+        # 检查是否所有标记 ID 都被检测到至少规定的次数
+        all_markers_ready = all([
+            self.marker_detections[marker_id]['count'] >= self.required_detections_per_marker
+            for marker_id in self.required_markers_ids
+        ])
+
+        if not all_markers_ready:
+            # 输出当前每个标记的检测次数
+            detection_counts = {
+                marker_id: self.marker_detections[marker_id]['count']
+                for marker_id in self.required_markers_ids
+            }
+            self.get_logger().info(
+                f"Waiting for all markers to be detected at least {self.required_detections_per_marker} times. "
+                f"Current counts: {detection_counts}"
+            )
+            return  # 未检测到足够的数据，继续等待
+        # if len(self.detected_markers) < self.required_markers_count:
+        #     self.get_logger().info(f"Detected {len(self.detected_markers)}/{self.required_markers_count} markers. Continuing calibration...")
+        #     return  # 未检测到足够的标记，继续等待
+        
+        #     # 使用所有累积的标记数据进行计算
+        # global_tvec_sum = np.zeros(3)
+        # global_rot_matrices = []
+            # 使用所有累积的数据进行计算
+        global_tvecs = []
+        global_rot_matrices = []
+
+        for marker_id in self.required_markers_ids:
+            detections = self.marker_detections[marker_id]
+            rvecs_list = detections['rvecs']
+            tvecs_list = detections['tvecs']
+            
+            # 对每个标记的位姿数据进行平均
+            avg_rvec = np.mean(np.array(rvecs_list), axis=0)
+            avg_tvec = np.mean(np.array(tvecs_list), axis=0)
+
+
+            
+            relative_pose = self.aruco_relative_poses.get(marker_id)
+            if relative_pose:
+                relative_translation = relative_pose["translation"]
+                relative_rotation = relative_pose["rotation"]
+
+                # 将旋转向量转换为旋转矩阵
+                detected_rot_matrix = cv2.Rodrigues(avg_rvec)[0]
+
+                # 计算此标记的全局变换矩阵
+                T_camera = np.eye(4)
+                T_camera[:3, :3] = detected_rot_matrix
+                T_camera[:3, 3] = avg_tvec.flatten()
+
+                T_tool = np.eye(4)
+                T_tool[:3, :3] = relative_rotation
+                T_tool[:3, 3] = relative_translation
+
+                T_global = T_camera @ np.linalg.inv(T_tool)
+                global_rot_matrices.append(T_global[:3, :3])
+                global_tvecs.append(T_global[:3, 3])
+        # 对所有全局位姿求平均
+        global_tvec_avg = np.mean(global_tvecs, axis=0)
+        global_rot_matrix_avg = np.mean(global_rot_matrices, axis=0)
+
+           # 计算针尖偏移
+        tip_calibration_offset_tool = global_rot_matrix_avg.T @ (board_center_position - global_tvec_avg)
+        self.tip_calibration_offset = tip_calibration_offset_tool
+        self.get_logger().info(f"Calibrated tip offset: {self.tip_calibration_offset}")
+        
+            # 保存标定结果
+        self.save_calibration_result()
+        # 完成标定后，重置累积变量
+        self.reset_calibration_data()
+        self.calibration_mode = False
+    
+    def reset_calibration_data(self):
+        # 重置累积的标记检测数据
+        self.marker_detections = {
+            marker_id: {'count': 0, 'rvecs': [], 'tvecs': []}
+            for marker_id in self.required_markers_ids
+        }
+
             
     def apply_kalman_filter(self, position):
         return self.kalman_filter.predict_and_update(position)
@@ -271,6 +380,7 @@ class ArucoNode(rclpy.node.Node):
     def calibrate_tip_callback(self, request, response):
         self.get_logger().info("Calibration request received.start calibrating")
         self.calibration_mode = True
+        self.reset_calibration_data()
         self.current_samples = 0
         self.tip_calibration_offsets = []
         return response
@@ -292,10 +402,32 @@ class ArucoNode(rclpy.node.Node):
             translation = np.array([radius * np.cos(theta), radius * np.sin(theta), 0.0])
             
             # 旋转矩阵：围绕Z轴旋转theta角度
-            rotation = tf3d.euler.euler2mat(0, 0, theta)  # 使用欧拉角表示旋转矩阵
+            # rotation = tf3d.euler.euler2mat(0, 0, theta)  # 使用欧拉角表示旋转矩阵
+             # 旋转矩阵：
+            # 1. 首先围绕 Z 轴旋转 theta，确定标记的分布方向
+            # 2. 然后，围绕 X 轴旋转 90 度（π/2），使标记平面垂直于表面，Z 轴指向外部
+            rotation_z = tf3d.euler.euler2mat(0, 0, theta)  # 围绕 Z 轴旋转 theta
+            rotation_x = tf3d.euler.euler2mat(np.pi / 2, 0, 0)  # 围绕 X 轴旋转 π/2
+            # 最终的旋转矩阵
+            rotation = np.dot(rotation_z, rotation_x)
             
             # 保存位姿信息
             aruco_relative_poses[aruco_id] = {"translation": translation, "rotation": rotation}
+        # 添加顶部中心的Aruco码ID为18   
+        aruco_id = 18
+        h = edge_length/ 2
+        translation_top = np.array([0, 0, h])
+        # 顶部Aruco码的旋转矩阵
+        # 因为它位于顶部，法向量沿着正Z轴，所以不需要额外的旋转
+        rotation_top = tf3d.euler.euler2mat(0, 0, 0)  
+        # 或者直接使用单位矩阵
+        # rotation_top = np.identity(3)
+         # 保存顶部Aruco码的位姿信息
+        aruco_relative_poses[aruco_id] = {
+            "translation": translation_top,
+            "rotation": rotation_top
+        }
+        
         return aruco_relative_poses
     
     def trans_pcd_callback(self, msg):
@@ -374,88 +506,184 @@ class ArucoNode(rclpy.node.Node):
         except FileNotFoundError:
             self.get_logger().warn(f"No calibration file found at {file_path}, please calibrate the system.")
 
-    def caculate_tip_offset(self, board_center_position, tool_rvecs_list, tool_tvecs_list):
-            """
-            校准针尖相对于工具上的 ArUco 码的固定偏移。
-            """
-            # 初始化计算全局中心位姿的变量
-            global_tvec_sum = np.zeros(3)
-            global_rot_matrices = []
-            # 提取旋转矩阵和平移向量以及对应的 ID
-            for (id_r, rvec), (id_t, tvec) in zip(tool_rvecs_list, tool_tvecs_list):
-                assert id_r == id_t, "旋转和位移向量的 ID 不匹配"
-                      # 使用 ID 获取相对位姿
-                relative_pose = self.aruco_relative_poses.get(id_r)
-                if relative_pose:
-                    relative_translation = relative_pose["translation"]
-                    relative_rotation = relative_pose["rotation"]
-                    
-                    # 将旋转向量转换为旋转矩阵
-                    detected_rot_matrix = cv2.Rodrigues(rvec)[0]
-                    
-                    # 计算相机坐标系下的全局旋转矩阵
-                    global_rot_matrix = detected_rot_matrix @ relative_rotation
-                    
-                    # 计算相机坐标系下的全局平移向量
-                    global_tvec = tvec.flatten() + detected_rot_matrix @ relative_translation
-                
-    def caculate_tip_offset(self, board_center_position, rvecs_list, tvecs_list):
+    def caculate_tip_offset2(self, board_center_position, tool_rvecs_list, tool_tvecs_list):
         """
         校准针尖相对于工具上的 ArUco 码的固定偏移。
         """
-        # 确保旋转向量和平移向量的数量相同，并且都大于3
-        # if len(rvecs_list) != 6 or len(tvecs_list) != 6:
-        #     self.get_logger().warn("Calibration requires must 6 markers.")
-        #     return
-        assert len(rvecs_list) == len(tvecs_list), "The number of rotation and translation vectors must be the same"
-        # 计算工具中心点位置
-        tool_avg_rot_matrix, tool_avg_tvec = self.calculate_center(rvecs_list, tvecs_list)
-        self.publish_tool_marker_position(tool_avg_tvec)
-        # 计算针尖相对于工具中心的偏移 (工具坐标系下)
-        tool_avg_rot_matrix_T = tool_avg_rot_matrix.T  # 工具上 ArUco 码相对于相机的旋转矩阵的转置
-        tip_calibration_offset_tool = tool_avg_rot_matrix_T @ (board_center_position - tool_avg_tvec)
+        # 初始化计算全局中心位姿的变量
+        global_tvec_sum = np.zeros(3)
+        global_rot_matrices = []
+        # 提取旋转矩阵和平移向量以及对应的 ID
+        for (id_r, rvec), (id_t, tvec) in zip(tool_rvecs_list, tool_tvecs_list):
+            assert id_r == id_t, "旋转和位移向量的 ID 不匹配"
+            if id_r not in self.detected_markers:
+                self.detected_markers.add(id_r)
+                    # 使用 ID 获取相对位姿
+            relative_pose = self.aruco_relative_poses.get(id_r)
+            if relative_pose:
+                relative_translation = relative_pose["translation"]
+                relative_rotation = relative_pose["rotation"]
+                
+                # 将旋转向量转换为旋转矩阵
+                detected_rot_matrix = cv2.Rodrigues(rvec)[0]
+                
+                # 计算此标记的全局变换矩阵
+                T_camera = np.eye(4)
+                T_camera[:3, :3] = detected_rot_matrix  # 设置旋转矩阵
+                T_camera[:3, 3] = tvec.flatten()  # 设置平移向量
 
-        # 存储当前采集的偏移量
+                T_tool = np.eye(4)
+                T_tool[:3, :3] = relative_rotation  # 设置相对旋转矩阵
+                T_tool[:3, 3] = relative_translation  # 设置相对平移向量
+
+                # 计算八棱柱中心相对于相机坐标系的全局变换矩阵
+                T_global = T_camera @ np.linalg.inv(T_tool)
+                # 提取平移向量
+                translation_vector = T_global[:3, 3]
+
+                self.get_logger().info(f"id: {id_r}, translation_vector: {translation_vector}")
+                # 累积旋转矩阵和平移向量
+                global_rot_matrices.append(T_global[:3, :3])
+                global_tvec_sum += translation_vector
+        # 计算平均平移向量（八棱柱中心在相机坐标系下的位置）
+        global_tvec_avg = global_tvec_sum / len(global_rot_matrices)
+
+        # 计算平均旋转矩阵
+        global_rot_matrix_avg = np.mean(global_rot_matrices, axis=0)
+            # 计算平均旋转矩阵（使用四元数平均化）
+        # quats = [tf3d.quaternions.mat2quat(rot_matrix) for rot_matrix in global_rot_matrices]
+        # avg_quat = np.mean(quats, axis=0)
+        # avg_quat /= np.linalg.norm(avg_quat)  # 归一化四元数
+        # global_rot_matrix_avg = tf3d.quaternions.quat2mat(avg_quat)
+
+        tip_calibration_offset_tool = global_rot_matrix_avg.T @ (board_center_position - global_tvec_avg)
         self.tip_calibration_offsets.append(tip_calibration_offset_tool)
-        self.current_samples += 1
-        self.get_logger().info(f"Collected {self.current_samples} samples/total need {self.calibration_samples}")
-
-        if self.current_samples >= self.calibration_samples:
-            # 计算平均偏移量
+        
+        self.get_logger().info(f"detected_markers: {self.detected_markers} , length:{len(self.detected_markers)}")
+        if len(self.detected_markers) >= self.required_markers_count:
             avg_tip_calibration_offset = np.mean(self.tip_calibration_offsets, axis=0)
             self.tip_calibration_offset = avg_tip_calibration_offset
             self.get_logger().info(f"Calibrated tip offset in tool coordinates: {self.tip_calibration_offset}！！！！！！！！！")
-
             #保存标定结果
             self.save_calibration_result()
-
-            # 重置采样计数器和偏移量列表
-            self.current_samples = 0
-            self.tip_calibration_offsets = []
             self.calibration_mode = False
 
-    def calculate_real_time_tip_position(self, rvecs, tvecs):
+
+        # #保留原来处理逻辑
+        # # 存储当前采集的偏移量
+        # self.tip_calibration_offsets.append(tip_calibration_offset_tool)
+        # self.current_samples += 1
+        # self.get_logger().info(f"Collected {self.current_samples} samples/total need {self.calibration_samples}")
+
+        # if self.current_samples >= self.calibration_samples:
+        #     # 计算平均偏移量
+        #     avg_tip_calibration_offset = np.mean(self.tip_calibration_offsets, axis=0)
+        #     self.tip_calibration_offset = avg_tip_calibration_offset
+        #     self.get_logger().info(f"Calibrated tip offset in tool coordinates: {self.tip_calibration_offset}！！！！！！！！！")
+
+        #     #保存标定结果
+        #     self.save_calibration_result()
+
+        #     # 重置采样计数器和偏移量列表
+        #     self.current_samples = 0
+        #     self.tip_calibration_offsets = []
+        #     self.calibration_mode = False
+    
+    
+
+
+                
+    # def caculate_tip_offset(self, board_center_position, rvecs_list, tvecs_list):
+    #     """
+    #     校准针尖相对于工具上的 ArUco 码的固定偏移。
+    #     """
+    #     # 确保旋转向量和平移向量的数量相同，并且都大于3
+    #     # if len(rvecs_list) != 6 or len(tvecs_list) != 6:
+    #     #     self.get_logger().warn("Calibration requires must 6 markers.")
+    #     #     return
+    #     assert len(rvecs_list) == len(tvecs_list), "The number of rotation and translation vectors must be the same"
+    #     # 计算工具中心点位置
+    #     tool_avg_rot_matrix, tool_avg_tvec = self.calculate_center(rvecs_list, tvecs_list)
+    #     self.publish_tool_marker_position(tool_avg_tvec)
+    #     # 计算针尖相对于工具中心的偏移 (工具坐标系下)
+    #     tool_avg_rot_matrix_T = tool_avg_rot_matrix.T  # 工具上 ArUco 码相对于相机的旋转矩阵的转置
+    #     tip_calibration_offset_tool = tool_avg_rot_matrix_T @ (board_center_position - tool_avg_tvec)
+
+    #     # 存储当前采集的偏移量
+    #     self.tip_calibration_offsets.append(tip_calibration_offset_tool)
+    #     self.current_samples += 1
+    #     self.get_logger().info(f"Collected {self.current_samples} samples/total need {self.calibration_samples}")
+
+    #     if self.current_samples >= self.calibration_samples:
+    #         # 计算平均偏移量
+    #         avg_tip_calibration_offset = np.mean(self.tip_calibration_offsets, axis=0)
+    #         self.tip_calibration_offset = avg_tip_calibration_offset
+    #         self.get_logger().info(f"Calibrated tip offset in tool coordinates: {self.tip_calibration_offset}！！！！！！！！！")
+
+    #         #保存标定结果
+    #         self.save_calibration_result()
+
+    #         # 重置采样计数器和偏移量列表
+    #         self.current_samples = 0
+    #         self.tip_calibration_offsets = []
+    #         self.calibration_mode = False
+
+    def calculate_real_time_tip_position(self, tool_rvecs_list, tool_tvecs_list):
         """
         根据当前检测到的多个Aruco码的位置和姿态，计算针尖的实时位置。
         """
-        if len(rvecs) == 0 or len(tvecs) == 0:
+        """
+        校准针尖相对于工具上的 ArUco 码的固定偏移。
+        """
+        if len(tool_rvecs_list) == 0 or len(tool_tvecs_list) == 0:
             return None
-
-        num_markers = len(rvecs)
-        if num_markers != 6:
-            self.get_logger().info(f"track require all 6 markers!")
+        # self.get_logger().warn(f"tip_calibration_offset: {self.tip_calibration_offset}")
+        if self.tip_calibration_offset is None or np.array(self.tip_calibration_offset).shape != (3,):
+            self.get_logger().warn("Calibration offset not set or has incorrect shape!")
             return None
+        # 初始化计算全局中心位姿的变量
+        global_tvec_sum = np.zeros(3)
+        global_rot_matrices = []
+        # 提取旋转矩阵和平移向量以及对应的 ID
+        for (id_r, rvec), (id_t, tvec) in zip(tool_rvecs_list, tool_tvecs_list):
+            assert id_r == id_t, "旋转和位移向量的 ID 不匹配"
+                    # 使用 ID 获取相对位姿
+            relative_pose = self.aruco_relative_poses.get(id_r)
+            if relative_pose:
+                relative_translation = relative_pose["translation"]
+                relative_rotation = relative_pose["rotation"]
+                
+                # 将旋转向量转换为旋转矩阵
+                detected_rot_matrix = cv2.Rodrigues(rvec)[0]
+                
+                # 计算此标记的全局变换矩阵
+                T_camera = np.eye(4)
+                T_camera[:3, :3] = detected_rot_matrix  # 设置旋转矩阵
+                T_camera[:3, 3] = tvec.flatten()  # 设置平移向量
 
-        avg_rot_matrix, avg_tvec = self.calculate_center(rvecs, tvecs)
+                T_tool = np.eye(4)
+                T_tool[:3, :3] = relative_rotation  # 设置相对旋转矩阵
+                T_tool[:3, 3] = relative_translation  # 设置相对平移向量
 
+                # 计算八棱柱中心相对于相机坐标系的全局变换矩阵
+                T_global = T_camera @ np.linalg.inv(T_tool)
+                # 累积旋转矩阵和平移向量
+                global_rot_matrices.append(T_global[:3, :3])
+                global_tvec_sum += T_global[:3, 3]
+        # 计算平均平移向量（八棱柱中心在相机坐标系下的位置）
+        global_tvec_avg = global_tvec_sum / len(global_rot_matrices)
 
-        # 正规化旋转矩阵，确保平均后的矩阵仍然是一个合法的旋转矩阵
-        U, _, Vt = np.linalg.svd(avg_rot_matrix)
-        avg_rot_matrix = np.dot(U, Vt)
+        # 计算平均旋转矩阵
+        global_rot_matrix_avg = np.mean(global_rot_matrices, axis=0)
+            # 计算平均旋转矩阵（使用四元数平均化）
+        # quats = [tf3d.quaternions.mat2quat(rot_matrix) for rot_matrix in global_rot_matrices]
+        # avg_quat = np.mean(quats, axis=0)
+        # avg_quat /= np.linalg.norm(avg_quat)  # 归一化四元数
+        # global_rot_matrix_avg = tf3d.quaternions.quat2mat(avg_quat)
 
         # 计算针尖的位置 (avg_tvec + avg_rot_matrix * tip_calibration_offset)
         # tip_position = np.dot(avg_rot_matrix, self.tip_calibration_offset) + avg_tvec
-        tip_position = avg_tvec + avg_rot_matrix @ np.array(self.tip_calibration_offset).reshape(3)
+        tip_position = global_tvec_avg + global_rot_matrix_avg @ np.array(self.tip_calibration_offset).reshape(3)
         # Apply Kalman Filter
         # smoothed_tip_position = self.apply_kalman_filter(tip_position)
         # Apply extender kalman filter
@@ -466,6 +694,39 @@ class ArucoNode(rclpy.node.Node):
         else:
             self.get_logger().warn(f"Unexpected smoothed_tip_position size: {smoothed_tip_position.size}")
             return None          
+
+    # def calculate_real_time_tip_position(self, rvecs, tvecs):
+    #     """
+    #     根据当前检测到的多个Aruco码的位置和姿态，计算针尖的实时位置。
+    #     """
+    #     if len(rvecs) == 0 or len(tvecs) == 0:
+    #         return None
+
+    #     # num_markers = len(rvecs)
+    #     # if num_markers != 6:
+    #     #     self.get_logger().info(f"track require all 6 markers!")
+    #     #     return None
+
+    #     avg_rot_matrix, avg_tvec = self.calculate_center(rvecs, tvecs)
+
+
+    #     # 正规化旋转矩阵，确保平均后的矩阵仍然是一个合法的旋转矩阵
+    #     U, _, Vt = np.linalg.svd(avg_rot_matrix)
+    #     avg_rot_matrix = np.dot(U, Vt)
+
+    #     # 计算针尖的位置 (avg_tvec + avg_rot_matrix * tip_calibration_offset)
+    #     # tip_position = np.dot(avg_rot_matrix, self.tip_calibration_offset) + avg_tvec
+    #     tip_position = avg_tvec + avg_rot_matrix @ np.array(self.tip_calibration_offset).reshape(3)
+    #     # Apply Kalman Filter
+    #     # smoothed_tip_position = self.apply_kalman_filter(tip_position)
+    #     # Apply extender kalman filter
+    #     smoothed_tip_position = self.apply_ekf(tip_position)
+    #     if smoothed_tip_position.size == 3:
+
+    #         return smoothed_tip_position
+    #     else:
+    #         self.get_logger().warn(f"Unexpected smoothed_tip_position size: {smoothed_tip_position.size}")
+    #         return None          
 
     def remove_outliers(self, data, threshold=3):
         """
