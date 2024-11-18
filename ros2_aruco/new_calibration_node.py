@@ -96,7 +96,7 @@ class ArucoNode(rclpy.node.Node):
         self.current_samples = 0
         
         # 八棱柱标定初始化
-        self.required_markers_ids = list(range(10, 18))  # 需要检测的 ArUco 码 ID 列表
+        self.required_markers_ids = list(range(10, 19))  # 需要检测的 ArUco 码 ID 列表
         self.aruco_relative_poses = self.caculate_relative_pose()  # 存储八棱柱上每个 ArUco 标记物的位姿
         self.detected_markers = set()  # 用于记录检测到的 ArUco 码 ID
         self.marker_poses = {}  # 用于存储每个标记的位姿
@@ -105,8 +105,8 @@ class ArucoNode(rclpy.node.Node):
             marker_id: {'count': 0, 'rvecs': [], 'tvecs': []}
             for marker_id in self.required_markers_ids
         }
-        self.required_markers_count = 8  # 标定要求至少8个不同的 ArUco 码
-        self.required_detections_per_marker = 10  # 每个ID需要的最少检测次数
+        self.required_markers_count = 9  # 标定要求至少9个不同的 ArUco 码
+        self.required_detections_per_marker = 50  # 每个ID需要的最少检测次数
 
         # 初始化 cv_image 为 None
         self.cv_image = None
@@ -208,12 +208,12 @@ class ArucoNode(rclpy.node.Node):
                     rvecs_list.append(rvecs[i])
                     tvecs_list.append(tvecs[i])
 
-                elif marker_id[0] in range(10, 18): # 工具上的Aruco码ID
+                elif marker_id[0] in range(10, 19): # 工具上的Aruco码ID
                     tool_rvecs_list.append((marker_id[0], rvecs[i])) 
                     tool_tvecs_list.append((marker_id[0], tvecs[i]))
                     marker_id_int = marker_id[0]
                      # 更新检测计数和位姿数据
-                    if self.calibration_mode:
+                    if self.calibration_mode and self.marker_detections[marker_id_int]['count'] < self.required_detections_per_marker:
                         self.marker_detections[marker_id_int]['count'] += 1
                         self.marker_detections[marker_id_int]['rvecs'].append(rvecs[i])
                         self.marker_detections[marker_id_int]['tvecs'].append(tvecs[i])
@@ -245,11 +245,14 @@ class ArucoNode(rclpy.node.Node):
                     return
                 #进行针尖校准
                 # self.caculate_tip_offset(board_center_position, tool_rvecs_list, tool_tvecs_list)
-                self.caculate_tip_offset(board_center_position)
+                # self.caculate_tip_offset(board_center_position)
+                self.caculate_tip_offset_LM(board_center_position)
             else:
             # 实时计算针尖位置
                 if self.tip_calibration_offset is not None:
-                    tip_position = self.calculate_real_time_tip_position(tool_rvecs_list, tool_tvecs_list)
+                    # tip_position = self.calculate_real_time_tip_position(tool_rvecs_list, tool_tvecs_list)
+                    tip_position = self.calculate_real_time_tip_position_LM(tool_rvecs_list, tool_tvecs_list)
+                    
                             # 确保 tip_position 是一个一维数组
                     self.publish_tool_tip_position(tip_position)
                     if tip_position is not None:
@@ -270,6 +273,94 @@ class ArucoNode(rclpy.node.Node):
         cv2.imshow("Aruco Image", self.cv_image)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             cv2.destroyAllWindows()
+
+    def caculate_tip_offset_LM(self,board_center_position):
+        # 检查是否所有标记 ID 都被检测到至少规定的次数
+        all_markers_ready = all([
+            self.marker_detections[marker_id]['count'] >= self.required_detections_per_marker
+            for marker_id in self.required_markers_ids
+        ])
+
+        if not all_markers_ready:
+            # 输出当前每个标记的检测次数
+            detection_counts = {
+                marker_id: self.marker_detections[marker_id]['count']
+                for marker_id in self.required_markers_ids
+            }
+            self.get_logger().info(
+                f"Waiting for all markers to be detected at least {self.required_detections_per_marker} times. "
+                f"Current counts: {detection_counts}"
+            )
+            return  # 未检测到足够的数据，继续等待
+        
+            # 将标记物的平移和旋转矩阵转换为残差函数的形式
+        def residuals(params, marker_tvecs, marker_rvecs, relative_poses, board_center_position):
+            """计算当前工具标记物和标定板的残差"""
+            residuals = []
+
+            # 提取旋转和平移向量的初始猜测值
+            rot_vec = params[:3]  # 旋转向量
+            t_vec = params[3:6]   # 平移向量
+
+            # 将旋转向量转换为旋转矩阵
+            R_estimated = cv2.Rodrigues(rot_vec)[0]
+
+            # 计算每个标记物的残差
+            for i, (marker_tvec, marker_rvec) in enumerate(zip(marker_tvecs, marker_rvecs)):
+                relative_pose = relative_poses[i]
+
+                # 计算工具上标记物的估计位置
+                T_tool_estimated = R_estimated @ relative_pose["translation"] + t_vec
+
+                # 计算误差 (标记物实际观测位置和估计位置之间的差异)
+                residual = marker_tvec.flatten() - T_tool_estimated.flatten()
+                residuals.extend(residual)
+            
+            return residuals
+
+        # 提取所有标记的旋转和平移数据，以及它们的相对位姿
+        marker_tvecs = []
+        marker_rvecs = []
+        relative_poses = []
+
+        for marker_id in self.required_markers_ids:
+            detections = self.marker_detections[marker_id]
+            avg_rvec = np.mean(np.array(detections['rvecs']), axis=0)
+            avg_tvec = np.mean(np.array(detections['tvecs']), axis=0)
+
+            marker_rvecs.append(avg_rvec)
+            marker_tvecs.append(avg_tvec)
+
+            relative_pose = self.aruco_relative_poses.get(marker_id)
+            relative_poses.append(relative_pose)
+        
+            # 初始的旋转和平移猜测值
+        initial_rot_vec = np.zeros(3)
+        initial_t_vec = np.zeros(3)
+
+        # 将初始值组合
+        initial_params = np.hstack([initial_rot_vec, initial_t_vec])
+
+        # 使用 Levenberg-Marquardt 方法进行优化
+        result = least_squares(residuals, initial_params, args=(marker_tvecs, marker_rvecs, relative_poses, board_center_position), method='lm')
+
+        # 提取优化后的旋转和平移参数
+        optimized_rot_vec = result.x[:3]
+        optimized_t_vec = result.x[3:6]
+        
+            # 将旋转向量转换为旋转矩阵
+        optimized_rot_matrix = cv2.Rodrigues(optimized_rot_vec)[0]
+
+           # 计算针尖偏移
+        tip_calibration_offset_tool = optimized_rot_matrix.T @ (board_center_position - optimized_t_vec)
+        self.tip_calibration_offset = tip_calibration_offset_tool
+        self.get_logger().info(f"Calibrated tip offset: {self.tip_calibration_offset}")
+        
+            # 保存标定结果
+        self.save_calibration_result()
+        # 完成标定后，重置累积变量
+        self.reset_calibration_data()
+        self.calibration_mode = False
 
     def caculate_tip_offset(self,board_center_position):
         # 检查是否所有标记 ID 都被检测到至少规定的次数
@@ -628,6 +719,96 @@ class ArucoNode(rclpy.node.Node):
     #         self.tip_calibration_offsets = []
     #         self.calibration_mode = False
 
+    def calculate_real_time_tip_position_LM(self, tool_rvecs_list, tool_tvecs_list):
+        """
+        使用非线性优化来计算针尖的实时位置。
+        """
+        """
+        校准针尖相对于工具上的 ArUco 码的固定偏移。
+        """
+        if len(tool_rvecs_list) == 0 or len(tool_tvecs_list) == 0:
+            return None
+        # self.get_logger().warn(f"tip_calibration_offset: {self.tip_calibration_offset}")
+        if self.tip_calibration_offset is None or np.array(self.tip_calibration_offset).shape != (3,):
+            self.get_logger().warn("Calibration offset not set or has incorrect shape!")
+            return None
+        
+            # 将标记物的平移和旋转矩阵转换为残差函数的形式
+        def residuals(params, tool_rvecs_list, tool_tvecs_list, relative_poses, tip_calibration_offset):
+            """计算当前工具标记物和相机坐标系下的残差"""
+            residuals = []
+
+            # 提取旋转和平移向量的初始猜测值
+            rot_vec = params[:3]  # 旋转向量
+            t_vec = params[3:6]   # 平移向量
+
+            # 将旋转向量转换为旋转矩阵
+            R_estimated = cv2.Rodrigues(rot_vec)[0]
+
+            # 计算每个标记物的残差
+            for i, (rvec, tvec_marker) in enumerate(zip(tool_rvecs_list, tool_tvecs_list)):
+                relative_pose = relative_poses[i]
+
+                # 计算工具上标记物的估计位置
+                T_tool_estimated = R_estimated @ relative_pose["translation"] + t_vec
+
+                # 计算误差 (标记物实际观测位置和估计位置之间的差异)
+                residual = tvec_marker.flatten() - T_tool_estimated.flatten()
+                residuals.extend(residual)
+            
+            # 加入针尖校准偏移量的残差
+            tip_position_estimated = t_vec + R_estimated @ tip_calibration_offset
+            residuals.extend(tip_position_estimated)  # 这里你可以根据需求调整加入针尖位置的影响
+
+            return residuals
+        
+            # 提取所有标记的旋转和平移数据，以及它们的相对位姿
+        marker_tvecs = []
+        marker_rvecs = []
+        relative_poses = []
+
+        for (id_r, rvec), (id_t, tvec) in zip(tool_rvecs_list, tool_tvecs_list):
+            assert id_r == id_t, "旋转和位移向量的 ID 不匹配"
+
+            # 提取每个标记的旋转和平移
+            marker_rvecs.append(rvec)
+            marker_tvecs.append(tvec)
+
+            # 获取相对位姿（相对于工具）
+            relative_pose = self.aruco_relative_poses.get(id_r)
+            if relative_pose:
+                relative_poses.append(relative_pose)
+            
+
+        # 初始的旋转和平移猜测值
+        initial_rot_vec = np.zeros(3)
+        initial_t_vec = np.zeros(3)
+
+        # 将初始值组合
+        initial_params = np.hstack([initial_rot_vec, initial_t_vec])
+
+        # 使用 Levenberg-Marquardt 方法进行优化
+        result = least_squares(residuals, initial_params, args=(marker_rvecs, marker_tvecs, relative_poses, self.tip_calibration_offset), method='lm')
+
+        # 提取优化后的旋转和平移参数
+        optimized_rot_vec = result.x[:3]
+        optimized_t_vec = result.x[3:6]
+
+        # 将旋转向量转换为旋转矩阵
+        optimized_rot_matrix = cv2.Rodrigues(optimized_rot_vec)[0]
+        tip_position = optimized_t_vec + optimized_rot_vec @ np.array(self.tip_calibration_offset).reshape(3)
+        # Apply Kalman Filter
+        # smoothed_tip_position = self.apply_kalman_filter(tip_position)
+        # Apply extender kalman filter
+        smoothed_tip_position = self.apply_ekf(tip_position)
+        if smoothed_tip_position.size == 3:
+
+            return smoothed_tip_position
+        else:
+            self.get_logger().warn(f"Unexpected smoothed_tip_position size: {smoothed_tip_position.size}")
+            return None          
+
+
     def calculate_real_time_tip_position(self, tool_rvecs_list, tool_tvecs_list):
         """
         根据当前检测到的多个Aruco码的位置和姿态，计算针尖的实时位置。
@@ -695,38 +876,7 @@ class ArucoNode(rclpy.node.Node):
             self.get_logger().warn(f"Unexpected smoothed_tip_position size: {smoothed_tip_position.size}")
             return None          
 
-    # def calculate_real_time_tip_position(self, rvecs, tvecs):
-    #     """
-    #     根据当前检测到的多个Aruco码的位置和姿态，计算针尖的实时位置。
-    #     """
-    #     if len(rvecs) == 0 or len(tvecs) == 0:
-    #         return None
-
-    #     # num_markers = len(rvecs)
-    #     # if num_markers != 6:
-    #     #     self.get_logger().info(f"track require all 6 markers!")
-    #     #     return None
-
-    #     avg_rot_matrix, avg_tvec = self.calculate_center(rvecs, tvecs)
-
-
-    #     # 正规化旋转矩阵，确保平均后的矩阵仍然是一个合法的旋转矩阵
-    #     U, _, Vt = np.linalg.svd(avg_rot_matrix)
-    #     avg_rot_matrix = np.dot(U, Vt)
-
-    #     # 计算针尖的位置 (avg_tvec + avg_rot_matrix * tip_calibration_offset)
-    #     # tip_position = np.dot(avg_rot_matrix, self.tip_calibration_offset) + avg_tvec
-    #     tip_position = avg_tvec + avg_rot_matrix @ np.array(self.tip_calibration_offset).reshape(3)
-    #     # Apply Kalman Filter
-    #     # smoothed_tip_position = self.apply_kalman_filter(tip_position)
-    #     # Apply extender kalman filter
-    #     smoothed_tip_position = self.apply_ekf(tip_position)
-    #     if smoothed_tip_position.size == 3:
-
-    #         return smoothed_tip_position
-    #     else:
-    #         self.get_logger().warn(f"Unexpected smoothed_tip_position size: {smoothed_tip_position.size}")
-    #         return None          
+ 
 
     def remove_outliers(self, data, threshold=3):
         """

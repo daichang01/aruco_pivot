@@ -17,8 +17,8 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='Nathan Sprague',
-    maintainer_email='nathan.r.sprague@gmail.com',
+    maintainer='daichang',
+    maintainer_email='18181985920@163.com',
     description='TODO: Package description',
     license='TODO: License declaration',
     tests_require=['pytest'],
@@ -26,8 +26,9 @@ setup(
         'console_scripts': [
             'aruco_generate_marker = ros2_aruco.aruco_generate_marker:main',
             "tip_tracking_node = ros2_aruco.tip_tracking_node:main",
-            # "board_calibration_node = ros2_aruco.board_calibration_node:main",
-            "board_calibration_node = ros2_aruco.new_calibration_node:main",
+            "board_calibration_node = ros2_aruco.board_calibration_node:main",
+            # 用于八棱柱专利实验
+            # "board_calibration_node = ros2_aruco.new_calibration_node:main",   
             
             "keyboard_publisher = ros2_aruco.keyboard_publisher:main"
         ],
