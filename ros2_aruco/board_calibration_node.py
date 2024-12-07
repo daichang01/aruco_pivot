@@ -92,8 +92,9 @@ class ArucoNode(rclpy.node.Node):
         self.calibration_mode = False  # Flag to enable calibration mode
 
         self.tip_calibration_offsets = []  # 存储多次采集的偏移量
-        self.calibration_samples = 20  # 采集样本数量
+        self.calibration_samples = 100  # 采集样本数量
         self.current_samples = 0
+        self.border_center_position = None #标定板中心位置
 
         # 初始化 cv_image 为 None
         self.cv_image = None
@@ -205,18 +206,24 @@ class ArucoNode(rclpy.node.Node):
             
             # # 获取当前时间
             # current_time = self.get_clock().now()
-
-            # 计算标定板中心点位置
-            if self.calibration_mode and len(rvecs_list) == 4 and len(tvecs_list) == 4:
-            # if  rvecs_list and tvecs_list:
+            # 先求标定板中心位置
+            if len(rvecs_list) == 4 and len(tvecs_list) == 4:
                 board_avg_rot_matrix, board_avg_tvec = self.calculate_center(rvecs_list, tvecs_list)
-                board_center_position = board_avg_tvec
-                if board_center_position is not None:
-                    self.publish_tool_tip_position(board_center_position)
+                self.border_center_position = board_avg_tvec
+                self.publish_tool_tip_position(self.border_center_position)
 
-                #进行针尖校准
-                self.caculate_tip_offset(board_center_position, tool_rvecs_list, tool_tvecs_list)
+        ###################################### 标定与定位 #####################################################
+            if self.calibration_mode and self.border_center_position is not None:
+                # 标定模式
+                #进行针尖校准 （关键步骤）
+                
+                self.caculate_tip_offset(self.border_center_position, tool_rvecs_list, tool_tvecs_list)
+                tip_text = f"Calibration mode"
+                cv2.putText(self.cv_image, tip_text, (1000, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
             else:
+                # 定位模式
+                tip_text = f"Positioning mode"
+                cv2.putText(self.cv_image, tip_text, (1000, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
             # 实时计算针尖位置
                 if self.tip_calibration_offset is not None:
                     tip_position = self.calculate_real_time_tip_position(tool_rvecs_list, tool_tvecs_list)
@@ -352,15 +359,16 @@ class ArucoNode(rclpy.node.Node):
         """
         校准针尖相对于工具上的 ArUco 码的固定偏移。
         """
-        # 确保旋转向量和平移向量的数量相同，并且都大于3
+        # 确保旋转向量和平移向量的数量都为6
         if len(rvecs_list) != 6 or len(tvecs_list) != 6:
-            self.get_logger().warn("Calibration requires must 6 markers.")
+            tip_text = f"calibration require all 6 markers!"
+            cv2.putText(self.cv_image, tip_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
             return
         assert len(rvecs_list) == len(tvecs_list), "The number of rotation and translation vectors must be the same"
         # 计算工具中心点位置
         tool_avg_rot_matrix, tool_avg_tvec = self.calculate_center(rvecs_list, tvecs_list)
         self.publish_tool_marker_position(tool_avg_tvec)
-        # 计算针尖相对于工具中心的偏移 (工具坐标系下)
+        # 计算针尖相对于工具中心的偏移 (工具坐标系下) 非常重要
         tool_avg_rot_matrix_T = tool_avg_rot_matrix.T  # 工具上 ArUco 码相对于相机的旋转矩阵的转置
         tip_calibration_offset_tool = tool_avg_rot_matrix_T @ (board_center_position - tool_avg_tvec)
 
@@ -392,7 +400,9 @@ class ArucoNode(rclpy.node.Node):
 
         num_markers = len(rvecs)
         if num_markers != 6:
-            self.get_logger().info(f"track require all 6 markers!")
+            # self.get_logger().info(f"track require all 6 markers!")
+            tip_text = f"track require all 6 markers!"
+            cv2.putText(self.cv_image, tip_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
             return None
 
         avg_rot_matrix, avg_tvec = self.calculate_center(rvecs, tvecs)
